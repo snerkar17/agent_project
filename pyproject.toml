@@ -1,0 +1,18 @@
+[project]
+name = "agent-project"
+version = "0.1.0"
+description = "Music store customer support agent over the Chinook database"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.4.2",
+    "langchain-anthropic>=1.7.4",
+    "langchain-community>=0.4.2",
+    "langgraph>=1.2.12",
+    "langgraph-cli[inmem]>=0.4.32",
+    "python-dotenv>=1.2.3",
+    "jupyterlab>=4.4",
+    "ipykernel>=7.3.0",
+    "jupytext>=1.19.5",
+    "langchain-openai>=1.6.6",
+]
