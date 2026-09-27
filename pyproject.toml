@@ -15,4 +15,7 @@ dependencies = [
     "ipykernel>=7.3.0",
     "jupytext>=1.19.5",
     "langchain-openai>=1.6.6",
+    "mcp>=1.30.0",
+    "langchain-mcp-adapters>=0.3.2",
+    "httpx>=0.28.1",
 ]
