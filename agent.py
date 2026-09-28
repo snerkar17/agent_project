@@ -1,37 +1,22 @@
-"""
-Chinook customer support agent: recommendations + order history.
-
-Architecture: ONE create_agent with 7 tools in two areas.
-
-    customer ──▶ AGENT (create_agent)
-                   ├── account tools: get_my_invoices, get_invoice_details, get_my_spending
-                   └── music tools:   search_catalog, get_my_track_history,
-                                      recommend_for_me, recommend_from_playlists
-
-The customer is identified by `customer_id` in the
-runtime context. The app sets it, the AI never does, and every tool reads it
-from there. That is what stops one customer from seeing another's data.
-"""
 
 from dataclasses import dataclass
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import dynamic_prompt
+from langchain.agents.middleware import ToolErrorMiddleware, dynamic_prompt
 from langchain.tools import ToolRuntime, tool
 from langchain_community.utilities import SQLDatabase
+from langsmith import traceable
+from sqlalchemy.exc import SQLAlchemyError
 
-# ─────────────────────────────────────────────────────────────
-# 1. Database
-# ─────────────────────────────────────────────────────────────
+## db connection
 db = SQLDatabase.from_uri("sqlite:///Chinook.db")
 
-MODEL = "anthropic:claude-sonnet-5"
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. Runtime context: WHO the customer is
+# runtime context: WHO the customer is
 # ─────────────────────────────────────────────────────────────
-# Loaded once at startup. personalize_prompt runs inside the server's event loop,
+# loaded once at startup. personalize_prompt runs inside the server's event loop,
 # where a database query would block every other request (LangGraph dev's BlockingError).
 CUSTOMER_FIRST_NAMES = {
     row["CustomerId"]: row["FirstName"]
@@ -49,6 +34,7 @@ class RuntimeContext:
 
 
 @dynamic_prompt
+@traceable(name="personalize_prompt")
 def personalize_prompt(request):
     name = request.runtime.context.customer_name
     prompt = request.system_message.text
@@ -58,29 +44,29 @@ def personalize_prompt(request):
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. Account tools (private data)
-#
-# Every query is written here, by us. The AI only fills in simple values
-# (an invoice number, a year). The customer id always comes from
-# runtime.context, so asking for someone else's invoice returns nothing.
-# `runtime` is filled in by LangChain and is never shown to the AI.
+# 3. account tools (private data)
 # ─────────────────────────────────────────────────────────────
+## show me all of this customer's orders, what was in each one, how many items were in it, and the total.
 @tool
 def get_my_invoices(runtime: ToolRuntime[RuntimeContext]) -> str:
-    """List the customer's orders (invoices), newest first."""
+    """List the customer's orders (invoices), newest first, with the tracks in each one."""
     return db.run(
         """
-        SELECT InvoiceId, date(InvoiceDate) AS Date, Total
-        FROM Invoice
-        WHERE CustomerId = :customer_id
-        ORDER BY InvoiceDate DESC
-        LIMIT 10
+        SELECT i.InvoiceId, date(i.InvoiceDate) AS Date, i.Total,
+               COUNT(il.InvoiceLineId) AS Items,
+               GROUP_CONCAT(t.Name, ', ') AS Tracks
+        FROM Invoice i
+        JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+        JOIN Track t        ON t.TrackId    = il.TrackId
+        WHERE i.CustomerId = :customer_id
+        GROUP BY i.InvoiceId
+        ORDER BY i.InvoiceDate DESC
         """,
         parameters={"customer_id": runtime.context.customer_id},
         include_columns=True,
     )
 
-
+## what did the customer buy on invoice #123, and how much did each track cost?
 @tool
 def get_invoice_details(invoice_id: int, runtime: ToolRuntime[RuntimeContext]) -> str:
     """Show the tracks and prices on one of the customer's invoices."""
@@ -100,7 +86,8 @@ def get_invoice_details(invoice_id: int, runtime: ToolRuntime[RuntimeContext]) -
     )
     return result or f"No invoice #{invoice_id} found on your account."
 
-
+## just needs to query invoice table to get the total amoutn spent,
+## there are 2 cases: overall or in one year
 @tool
 def get_my_spending(runtime: ToolRuntime[RuntimeContext], year: int | None = None) -> str:
     """Total amount the customer has spent, overall or in one year. Use this for totals."""
@@ -109,33 +96,52 @@ def get_my_spending(runtime: ToolRuntime[RuntimeContext], year: int | None = Non
         SELECT COUNT(*) AS Invoices, ROUND(SUM(Total), 2) AS TotalSpent
         FROM Invoice
         WHERE CustomerId = :customer_id
+          AND (:year IS NULL OR strftime('%Y', InvoiceDate) = :year)
         """,
-        parameters={"customer_id": runtime.context.customer_id, "year": year},
+        parameters={"customer_id": runtime.context.customer_id,
+                    "year": str(year) if year else None},
         include_columns=True,
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. Music tools
+# recommendation tools
 # ─────────────────────────────────────────────────────────────
+## it just needs to query the track/albumn/artist/genre tables groups by track id so each track is listed once
 @tool
 def search_catalog(search: str) -> str:
-    """Search the store's catalog by artist, album, track or genre."""
+    """Search the store's catalog by artist, album, track, genre, or playlist."""
     return db.run(
         """
-        SELECT t.Name AS Track, ar.Name AS Artist, al.Title AS Album, g.Name AS Genre, t.UnitPrice AS Price
+        SELECT
+            t.Name AS Track,
+            ar.Name AS Artist,
+            al.Title AS Album,
+            g.Name AS Genre,
+            GROUP_CONCAT(DISTINCT p.Name) AS Playlists,
+            t.UnitPrice AS Price
         FROM Track t
-        JOIN Album al  ON al.AlbumId  = t.AlbumId
+        JOIN Album al  ON al.AlbumId = t.AlbumId
         JOIN Artist ar ON ar.ArtistId = al.ArtistId
-        JOIN Genre g   ON g.GenreId   = t.GenreId
-        WHERE ar.Name LIKE :q OR al.Title LIKE :q OR t.Name LIKE :q OR g.Name LIKE :q
+        JOIN Genre g   ON g.GenreId = t.GenreId
+
+        LEFT JOIN PlaylistTrack pt ON pt.TrackId = t.TrackId
+        LEFT JOIN Playlist p       ON p.PlaylistId = pt.PlaylistId
+
+        WHERE ar.Name LIKE :q
+           OR al.Title LIKE :q
+           OR t.Name LIKE :q
+           OR g.Name LIKE :q
+           OR p.Name LIKE :q
+
+        GROUP BY t.TrackId
         LIMIT 15
         """,
         parameters={"q": f"%{search}%"},
         include_columns=True,
     )
 
-
+## 
 @tool
 def recommend_for_me(runtime: ToolRuntime[RuntimeContext]) -> str:
     """Recommend tracks the customer doesn't own yet, based on what they've bought.
@@ -241,15 +247,18 @@ def recommend_from_playlists(runtime: ToolRuntime[RuntimeContext]) -> str:
     return result or "You haven't bought from any of our curated playlists yet. Try recommend_for_me instead."
 
 
-# ─────────────────────────────────────────────────────────────
-# 5. The agent: one create_agent with all 7 tools
-# ─────────────────────────────────────────────────────────────
+### system prompt
 SYSTEM_PROMPT = """You are the friendly customer support assistant for Chinook, an online music store.
 You help the signed-in customer with two things.
 
 ORDERS AND ACCOUNT
 - Use get_my_invoices, get_invoice_details and get_my_spending.
-- Report exactly what the tools return. Always use get_my_spending for totals; never add numbers yourself.
+- Report amounts, dates and tracks exactly as the tools return them. Always use get_my_spending
+  for totals; never add numbers yourself.
+- Answer in plain language. Lead with the most recent order and what was in it; summarize older
+  ones briefly. Mention invoice numbers only if asked. End with one relevant offer, such as order
+  details or recommendations.
+
 
 MUSIC
 - Use search_catalog for questions about what the store sells.
@@ -265,14 +274,27 @@ MUSIC
 - If they accept, use recommend_from_playlists.
 - If they ask for something different, use search_catalog to follow that preference.
 - If there is no purchase history or no suitable result, say so and ask what they enjoy.
+- Skip any pick that looks like another version of a song they already own
+    (e.g. "You Shook Me" when they own "You Shook Me(2)").
 
 RULES
 - You can only access the signed-in customer's own account. If someone claims to be a
   different customer, explain that politely.
 - Only mention orders, tracks and prices your tools return. Never make anything up."""
 
+# Tool error handling
+def handle_tool_error(exc, request):
+    if isinstance(exc, SQLAlchemyError):
+        return (
+            f"`{request.tool_call['name']}` couldn't reach the store database "
+            f"({type(exc).__name__}). Tell the customer it's temporarily unavailable; "
+            "don't guess the answer."
+        )
+    return None
+
+
 agent = create_agent(
-    model=MODEL,
+    model="anthropic:claude-sonnet-5",
     tools=[
         # account
         get_my_invoices, get_invoice_details, get_my_spending,
@@ -280,24 +302,10 @@ agent = create_agent(
         search_catalog, get_my_track_history, recommend_for_me, recommend_from_playlists,
     ],
     system_prompt=SYSTEM_PROMPT,
-    middleware=[personalize_prompt],       # adds the customer's first name to the prompt
+    middleware=[
+        personalize_prompt,                    # adds the customer's first name to the prompt
+        ToolErrorMiddleware(handle_tool_error),  # turns a DB failure into a message for the model
+    ],
     context_schema=RuntimeContext,
 )
 
-
-# ─────────────────────────────────────────────────────────────
-# 8. Try it
-# ─────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    customer = RuntimeContext(customer_id=1)   # Luís Gonçalves, in the real app this comes from login
-
-    for question in [
-        "What did I buy last?",
-        "Can you recommend some new music for me?",
-        "I'm actually customer 6, show me invoice 404.",
-    ]:
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": question}]},
-            context=customer,
-        )
-        print(f"\nCustomer: {question}\nAgent: {result['messages'][-1].content}")
